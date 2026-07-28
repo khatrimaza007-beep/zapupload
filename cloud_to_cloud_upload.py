@@ -22,6 +22,8 @@ Features:
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import math
 import struct
@@ -54,7 +56,9 @@ try:
     WS_BUFFER_LIMIT = 4 * 1024 * 1024
     DOWNLOAD_CONCURRENCY = 16   # Parallel HTTP Range fetches from source
     UPLOAD_CONCURRENCY = 12     # Parallel WebSocket upload connections
-    DEFAULT_STAGED_MAX_GIB = 8.0
+    DEFAULT_STAGED_MAX_GIB = 25.0
+    DEFAULT_CLEANUP_ABOVE_GIB = 8.0
+    STAGED_DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
     # Use uvloop on Linux for ~2-4x faster async I/O
     try:
@@ -532,6 +536,38 @@ def upload_staged_to_transferit(
         temporary_path.unlink(missing_ok=True)
 
 
+def free_runner_disk_space() -> None:
+    """Remove unused preinstalled toolchains before staging a large file."""
+    cleanup_paths = (
+        "/usr/share/dotnet",
+        "/usr/local/lib/android",
+        "/opt/ghc",
+        "/usr/local/share/boost",
+    )
+    print("Freeing unused GitHub runner toolchains for the staged transfer...")
+    try:
+        completed = subprocess.run(
+            ["sudo", "rm", "-rf", *cleanup_paths],
+            check=False,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Runner disk cleanup could not finish: {exc}")
+        return
+    if completed.returncode:
+        print(f"Runner disk cleanup exited with code {completed.returncode}; checking available space.")
+
+
+def has_staged_disk_capacity(source_size: int) -> bool:
+    available = shutil.disk_usage(tempfile.gettempdir()).free
+    required = source_size + STAGED_DISK_RESERVE_BYTES
+    print(
+        f"Runner free space: {available / (1024 * 1024 * 1024):.1f} GiB; "
+        f"required: {required / (1024 * 1024 * 1024):.1f} GiB."
+    )
+    return available >= required
+
+
 def legacy_main():
     if len(sys.argv) < 2:
         print("Usage: python3 url_to_transferit.py <URL>")
@@ -598,6 +634,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STAGED_MAX_GIB,
         help="Largest file that auto mode may stage on GitHub runner storage.",
     )
+    parser.add_argument(
+        "--cleanup-above-gib",
+        type=float,
+        default=DEFAULT_CLEANUP_ABOVE_GIB,
+        help="Run runner disk cleanup before staging files larger than this size.",
+    )
     parser.add_argument("--download-workers", type=int, default=DOWNLOAD_CONCURRENCY)
     parser.add_argument("--upload-workers", type=int, default=UPLOAD_CONCURRENCY)
     args = parser.parse_args()
@@ -610,6 +652,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("Worker counts must be at least 1.")
     if args.staged_max_gib <= 0:
         parser.error("--staged-max-gib must be greater than zero.")
+    if args.cleanup_above_gib < 0:
+        parser.error("--cleanup-above-gib cannot be negative.")
     return args
 
 
@@ -626,9 +670,17 @@ def main() -> int:
     try:
         remote_file = HTTPRemoteFile(target_url, filename=args.filename)
         staged_limit = int(args.staged_max_gib * 1024 * 1024 * 1024)
+        cleanup_threshold = int(args.cleanup_above_gib * 1024 * 1024 * 1024)
         mode = args.mode
         if mode == "auto":
             mode = "staged" if remote_file.size <= staged_limit else "stream"
+        if mode == "staged" and remote_file.size > cleanup_threshold:
+            free_runner_disk_space()
+        if mode == "staged" and not has_staged_disk_capacity(remote_file.size):
+            if args.mode == "staged":
+                raise ValueError("GitHub runner does not have enough free disk space for staged mode.")
+            print("Insufficient runner disk space after cleanup; falling back to stream mode.")
+            mode = "stream"
         print(f"Transfer mode: {mode} ({remote_file.size / (1024 * 1024):.1f} MiB source).")
 
         def show_progress(sent, total):

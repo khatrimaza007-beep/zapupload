@@ -64,7 +64,8 @@ jobs:
             --filename "$SOURCE_FILENAME" \
             --result-json "$RESULT_JSON" \
             --mode auto \
-            --staged-max-gib 8 \
+            --staged-max-gib 25 \
+            --cleanup-above-gib 8 \
             --download-workers 8 \
             --upload-workers 8 | tee "$RUNNER_TEMP/transferit.log"
 
