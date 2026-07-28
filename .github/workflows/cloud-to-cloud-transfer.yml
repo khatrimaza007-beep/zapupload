@@ -5,9 +5,13 @@ run-name: TransferIt row ${{ inputs.row_number }} (${{ inputs.request_id }})
 on:
   workflow_dispatch:
     inputs:
-      r2_url:
-        description: Public R2 Download URL for the original file
+      source_url:
+        description: Public R2, SKYDROP, Google Photos, or Google Drive URL
         required: true
+        type: string
+      source_kind:
+        description: Source type selected by main.py
+        required: false
         type: string
       filename:
         description: Original filename to preserve in TransferIt
@@ -46,27 +50,35 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-transferit-py-v2
+          key: ${{ runner.os }}-transferit-py-v3
           restore-keys: ${{ runner.os }}-transferit-py-
 
       - name: Install dependencies
-        run: python -m pip install transferit-py httpx beautifulsoup4 pycryptodomex websockets uvloop
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+          python -m pip install transferit-py httpx beautifulsoup4 pycryptodomex websockets uvloop gdown
 
-      - name: Transfer R2 to TransferIt
+      - name: Transfer source to TransferIt
         env:
-          SOURCE_URL: ${{ inputs.r2_url }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           SOURCE_FILENAME: ${{ inputs.filename }}
           RESULT_JSON: ${{ runner.temp }}/transferit-result.json
         run: |
           set -o pipefail
+          SOURCE_KIND_ARG=()
+          if [ -n "$SOURCE_KIND" ]; then
+            SOURCE_KIND_ARG=(--source-kind "$SOURCE_KIND")
+          fi
           python cloud_to_cloud_upload.py \
             --url "$SOURCE_URL" \
+            "${SOURCE_KIND_ARG[@]}" \
             --filename "$SOURCE_FILENAME" \
             --result-json "$RESULT_JSON" \
             --mode auto \
             --staged-max-gib 25 \
             --cleanup-above-gib 8 \
-            --download-workers 8 \
+            --download-workers 16 \
             --upload-workers 8 | tee "$RUNNER_TEMP/transferit.log"
 
       - name: Upload TransferIt result
