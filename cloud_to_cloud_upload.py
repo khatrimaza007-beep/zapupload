@@ -21,7 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 DEFAULT_STAGED_MAX_GIB = 25.0
 DEFAULT_CLEANUP_ABOVE_GIB = 8.0
 DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
@@ -120,6 +120,18 @@ def response_size(headers: httpx.Headers) -> int:
 
 
 def inspect_http_source(url: str, requested_filename: str, kind: str) -> ResolvedSource:
+    # SkyDrop's alexdirect endpoint must be handed to the downloader unchanged.
+    # Following it during the metadata probe can redirect a healthy source to a
+    # short-lived api.php URL before aria2c gets the original request.
+    if kind == "skydrop":
+        filename = Path(requested_filename).name if requested_filename.strip() else "skydrop_download.bin"
+        return ResolvedSource(
+            original_url=url,
+            direct_url=url,
+            filename=filename,
+            size_bytes=0,
+            kind=kind,
+        )
     headers = {"User-Agent": USER_AGENT}
     direct_url = url
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0), headers=headers) as client:
@@ -164,31 +176,42 @@ def has_disk_capacity(size_bytes: int) -> bool:
 
 
 def download_single_stream(url: str, output_path: Path) -> None:
-    started_at = time.monotonic()
-    downloaded = 0
-    with httpx.Client(
-        follow_redirects=True,
-        timeout=httpx.Timeout(connect=60.0, read=600.0, write=120.0, pool=120.0),
-        headers={"User-Agent": USER_AGENT},
-    ) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            expected = response_size(response.headers)
-            with output_path.open("wb") as output:
-                for block in response.iter_bytes(chunk_size=8 * 1024 * 1024):
-                    if not block:
-                        continue
-                    output.write(block)
-                    downloaded += len(block)
-                    elapsed = max(time.monotonic() - started_at, 0.001)
-                    percent = downloaded * 100 / expected if expected else 0
-                    print(
-                        f"\rDownloading: {downloaded / (1024 ** 2):.1f} MiB "
-                        f"({percent:.1f}%) | {downloaded / (1024 ** 2) / elapsed:.1f} MiB/s",
-                        end="",
-                        flush=True,
-                    )
-    print("")
+    for attempt in range(1, 6):
+        started_at = time.monotonic()
+        downloaded = 0
+        try:
+            with httpx.Client(
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=60.0, read=600.0, write=120.0, pool=120.0),
+                headers={"User-Agent": USER_AGENT},
+            ) as client:
+                with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    expected = response_size(response.headers)
+                    with output_path.open("wb") as output:
+                        for block in response.iter_bytes(chunk_size=8 * 1024 * 1024):
+                            if not block:
+                                continue
+                            output.write(block)
+                            downloaded += len(block)
+                            elapsed = max(time.monotonic() - started_at, 0.001)
+                            percent = downloaded * 100 / expected if expected else 0
+                            print(
+                                f"\rDownloading: {downloaded / (1024 ** 2):.1f} MiB "
+                                f"({percent:.1f}%) | {downloaded / (1024 ** 2) / elapsed:.1f} MiB/s",
+                                end="",
+                                flush=True,
+                            )
+            print("")
+            return
+        except httpx.HTTPStatusError as exc:
+            output_path.unlink(missing_ok=True)
+            status = exc.response.status_code
+            if status not in {429, 500, 502, 503, 504} or attempt == 5:
+                raise
+            wait_seconds = attempt * 10
+            print(f"HTTP {status} from source; retrying the original URL in {wait_seconds}s.")
+            time.sleep(wait_seconds)
 
 
 def download_http_source(source: ResolvedSource, output_path: Path, download_workers: int) -> None:
@@ -207,6 +230,8 @@ def download_http_source(source: ResolvedSource, output_path: Path, download_wor
             "--auto-file-renaming=false",
             "--summary-interval=1",
             "--console-log-level=warn",
+            "--max-tries=5",
+            "--retry-wait=10",
             "--user-agent", USER_AGENT,
             "-d", str(output_path.parent),
             "-o", output_path.name,
