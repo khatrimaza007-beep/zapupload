@@ -14,7 +14,9 @@ Features:
   - Auto-resolves landing pages to direct stream links.
   - Auto-refreshes expired URL signatures mid-transfer.
   - AES-128-CTR encryption in memory.
-  - Zero local disk storage required.
+  - Auto mode uses a staged local file for faster R2-to-TransferIt uploads
+    when the file fits safely on the GitHub runner disk.
+  - Large files retain the zero-local-disk streaming path.
 """
 
 import argparse
@@ -24,6 +26,9 @@ import sys
 import math
 import struct
 import asyncio
+import tempfile
+import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from datetime import datetime
@@ -49,6 +54,7 @@ try:
     WS_BUFFER_LIMIT = 4 * 1024 * 1024
     DOWNLOAD_CONCURRENCY = 16   # Parallel HTTP Range fetches from source
     UPLOAD_CONCURRENCY = 12     # Parallel WebSocket upload connections
+    DEFAULT_STAGED_MAX_GIB = 8.0
 
     # Use uvloop on Linux for ~2-4x faster async I/O
     try:
@@ -397,13 +403,14 @@ def upload_url_to_transferit(
     dl_concurrency: int = DOWNLOAD_CONCURRENCY,
     ul_concurrency: int = UPLOAD_CONCURRENCY,
     on_progress=None,
+    remote_file: HTTPRemoteFile | None = None,
 ):
     """
     Cloud-to-Cloud Upload: Directly streams from HTTP URL -> Encrypts -> Transfer.it
     Uses a pipelined architecture for maximum throughput.
     """
     print(f"🔗 Inspecting URL: {url}")
-    remote_file = HTTPRemoteFile(url, filename=custom_filename)
+    remote_file = remote_file or HTTPRemoteFile(url, filename=custom_filename)
     filename = remote_file.filename
     size_mb = remote_file.size / (1024 * 1024)
 
@@ -451,6 +458,78 @@ def upload_url_to_transferit(
 
         transfer_url = f"{SHARE_BASE}/t/{xh}"
         return transfer_url, filename, remote_file.size
+
+
+def upload_staged_to_transferit(
+    remote_file: HTTPRemoteFile,
+    upload_concurrency: int,
+) -> tuple[str, str, int]:
+    """Download once to runner storage, then use TransferIt's native file uploader."""
+    suffix = f"-{uuid.uuid4().hex}-{Path(remote_file.filename).name}"
+    temporary_path = Path(tempfile.gettempdir()) / f"transferit{suffix}"
+    total = remote_file.size
+    downloaded = 0
+    download_started = time.monotonic()
+
+    try:
+        print(f"Downloading {total / (1024 * 1024):.1f} MiB to the GitHub runner...")
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=60.0, read=120.0, write=120.0, pool=120.0),
+            headers=remote_file.headers,
+        ) as client:
+            with client.stream("GET", remote_file.url) as response:
+                response.raise_for_status()
+                with temporary_path.open("wb") as output:
+                    for block in response.iter_bytes(chunk_size=8 * 1024 * 1024):
+                        output.write(block)
+                        downloaded += len(block)
+                        elapsed = max(time.monotonic() - download_started, 0.001)
+                        speed = downloaded / (1024 * 1024) / elapsed
+                        sys.stdout.write(
+                            f"\rDownloading: {downloaded / (1024 * 1024):.1f} / "
+                            f"{total / (1024 * 1024):.1f} MiB ({downloaded * 100 / total:.1f}%) | "
+                            f"{speed:.1f} MiB/s"
+                        )
+                        sys.stdout.flush()
+        if downloaded != total:
+            raise ValueError(f"Downloaded {downloaded} bytes, expected {total} bytes.")
+        download_elapsed = max(time.monotonic() - download_started, 0.001)
+        print(
+            f"\nDownload finished in {download_elapsed:.0f}s "
+            f"({downloaded / (1024 * 1024) / download_elapsed:.1f} MiB/s)."
+        )
+
+        upload_started = time.monotonic()
+        print("Uploading to TransferIt with the native uploader...")
+
+        def upload_progress(sent: int, expected_total: int) -> None:
+            elapsed = max(time.monotonic() - upload_started, 0.001)
+            speed = sent / (1024 * 1024) / elapsed
+            sys.stdout.write(
+                f"\rUploading: {sent / (1024 * 1024):.1f} / "
+                f"{expected_total / (1024 * 1024):.1f} MiB "
+                f"({sent * 100 / expected_total:.1f}%) | {speed:.1f} MiB/s"
+            )
+            sys.stdout.flush()
+
+        with Transferit() as client:
+            upload_result = client.upload(
+                str(temporary_path),
+                concurrency=max(1, min(8, upload_concurrency)),
+                on_progress=upload_progress,
+            )
+        transfer_url = str(getattr(upload_result, "url", "")).strip()
+        if not transfer_url:
+            raise ValueError("TransferIt native uploader returned no share URL.")
+        upload_elapsed = max(time.monotonic() - upload_started, 0.001)
+        print(
+            f"\nUpload finished in {upload_elapsed:.0f}s "
+            f"({total / (1024 * 1024) / upload_elapsed:.1f} MiB/s)."
+        )
+        return transfer_url, remote_file.filename, total
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def legacy_main():
@@ -507,6 +586,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", dest="url_option", help="Direct R2 download URL or landing page URL.")
     parser.add_argument("--filename", help="Filename to preserve in TransferIt.")
     parser.add_argument("--result-json", help="Write a structured success or failure result to this file.")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "staged", "stream"),
+        default="auto",
+        help="auto stages files that fit the runner disk; stream keeps data off disk.",
+    )
+    parser.add_argument(
+        "--staged-max-gib",
+        type=float,
+        default=DEFAULT_STAGED_MAX_GIB,
+        help="Largest file that auto mode may stage on GitHub runner storage.",
+    )
     parser.add_argument("--download-workers", type=int, default=DOWNLOAD_CONCURRENCY)
     parser.add_argument("--upload-workers", type=int, default=UPLOAD_CONCURRENCY)
     args = parser.parse_args()
@@ -517,6 +608,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("A source URL is required.")
     if args.download_workers < 1 or args.upload_workers < 1:
         parser.error("Worker counts must be at least 1.")
+    if args.staged_max_gib <= 0:
+        parser.error("--staged-max-gib must be greater than zero.")
     return args
 
 
@@ -524,8 +617,6 @@ def main() -> int:
     args = parse_args()
     target_url = args.source_url
     print("Starting cloud transfer to TransferIt.")
-    import time
-
     started_at = time.time()
     result = {
         "ok": False,
@@ -533,6 +624,13 @@ def main() -> int:
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
     try:
+        remote_file = HTTPRemoteFile(target_url, filename=args.filename)
+        staged_limit = int(args.staged_max_gib * 1024 * 1024 * 1024)
+        mode = args.mode
+        if mode == "auto":
+            mode = "staged" if remote_file.size <= staged_limit else "stream"
+        print(f"Transfer mode: {mode} ({remote_file.size / (1024 * 1024):.1f} MiB source).")
+
         def show_progress(sent, total):
             pct = (sent / total) * 100 if total else 0
             elapsed = time.time() - started_at
@@ -544,13 +642,20 @@ def main() -> int:
             )
             sys.stdout.flush()
 
-        link, filename, size = upload_url_to_transferit(
-            target_url,
-            custom_filename=args.filename,
-            dl_concurrency=args.download_workers,
-            ul_concurrency=args.upload_workers,
-            on_progress=show_progress,
-        )
+        if mode == "staged":
+            link, filename, size = upload_staged_to_transferit(
+                remote_file,
+                upload_concurrency=args.upload_workers,
+            )
+        else:
+            link, filename, size = upload_url_to_transferit(
+                target_url,
+                custom_filename=args.filename,
+                dl_concurrency=args.download_workers,
+                ul_concurrency=args.upload_workers,
+                on_progress=show_progress,
+                remote_file=remote_file,
+            )
         elapsed = time.time() - started_at
         average_speed = (size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
         result.update(
@@ -561,6 +666,7 @@ def main() -> int:
                 "size_bytes": size,
                 "elapsed_seconds": round(elapsed, 3),
                 "average_mib_per_second": round(average_speed, 3),
+                "mode": mode,
             }
         )
         write_result(args.result_json, result)

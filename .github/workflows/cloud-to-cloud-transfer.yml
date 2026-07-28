@@ -63,8 +63,10 @@ jobs:
             --url "$SOURCE_URL" \
             --filename "$SOURCE_FILENAME" \
             --result-json "$RESULT_JSON" \
+            --mode auto \
+            --staged-max-gib 8 \
             --download-workers 8 \
-            --upload-workers 6 | tee "$RUNNER_TEMP/transferit.log"
+            --upload-workers 8 | tee "$RUNNER_TEMP/transferit.log"
 
       - name: Upload TransferIt result
         if: always()
