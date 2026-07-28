@@ -93,9 +93,16 @@ class HTTPRemoteFile:
                 direct_link = None
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
-                    if "dl=" in href or any(href.lower().endswith(ext) for ext in (".mkv", ".mp4", ".avi", ".mov")):
+                    if "dl=r2" in href.lower():
                         direct_link = urljoin(self.url, href)
                         break
+
+                if not direct_link:
+                    for a in soup.find_all("a", href=True):
+                        href = a["href"]
+                        if "dl=" in href or any(href.lower().endswith(ext) for ext in (".mkv", ".mp4", ".avi", ".mov")):
+                            direct_link = urljoin(self.url, href)
+                            break
 
                 if not direct_link:
                     raise ValueError(f"Could not find direct download link on landing page {self.url}")
