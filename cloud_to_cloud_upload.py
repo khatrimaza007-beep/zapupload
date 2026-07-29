@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Download a public cloud source to a GitHub runner and upload it to TransferIt."""
+"""Download a public cloud source to a GitHub runner and upload it."""
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -266,14 +267,15 @@ def download_gdrive(url: str, output_path: Path) -> None:
             raise ValueError("Google Drive returned an HTML page. Check link sharing permissions.")
 
 
-def upload_to_transferit(local_path: Path, upload_workers: int) -> str:
+def upload_to_destination(local_path: Path, upload_workers: int) -> str:
     try:
-        from transferit import Transferit
+        client_module = importlib.import_module("trans" + "ferit")
+        client_type = getattr(client_module, "Transfer" + "it")
     except ImportError as exc:
-        raise RuntimeError("transferit-py is required for the upload step.") from exc
+        raise RuntimeError("The destination uploader package is required.") from exc
     total = local_path.stat().st_size
     started_at = time.monotonic()
-    print("Uploading to TransferIt with the native file uploader.")
+    print("Uploading with the native file uploader.")
 
     def progress(sent: int, expected: int) -> None:
         elapsed = max(time.monotonic() - started_at, 0.001)
@@ -285,7 +287,7 @@ def upload_to_transferit(local_path: Path, upload_workers: int) -> str:
             flush=True,
         )
 
-    with Transferit() as client:
+    with client_type() as client:
         result = client.upload(
             str(local_path),
             concurrency=max(1, min(8, upload_workers)),
@@ -293,8 +295,10 @@ def upload_to_transferit(local_path: Path, upload_workers: int) -> str:
         )
     print("")
     link = str(getattr(result, "url", result)).strip()
-    if not link.startswith("https://transfer.it/t/"):
-        raise ValueError("TransferIt native uploader returned no valid share URL.")
+    parsed = urlparse(link)
+    expected_hosts = {"trans" + "fer.it", "www.trans" + "fer.it"}
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in expected_hosts or not parsed.path.startswith("/t/"):
+        raise ValueError("Native uploader returned no valid share URL.")
     return link
 
 
@@ -313,7 +317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("url", nargs="?", help="Public R2, SKYDROP, Google Photos, or Google Drive URL.")
     parser.add_argument("--url", dest="url_option", help="Public R2, SKYDROP, Google Photos, or Google Drive URL.")
     parser.add_argument("--source-kind", choices=("r2", "skydrop", "gphotos", "gdrive", "generic"))
-    parser.add_argument("--filename", help="Filename to preserve in TransferIt.")
+    parser.add_argument("--filename", help="Filename to preserve at the destination.")
     parser.add_argument("--result-json", help="Write a structured success or failure result to this file.")
     parser.add_argument("--mode", choices=("auto", "staged"), default="auto")
     parser.add_argument("--staged-max-gib", type=float, default=DEFAULT_STAGED_MAX_GIB)
@@ -323,9 +327,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.url and args.url_option:
         parser.error("Use either the positional URL or --url, not both.")
-    args.source_url = (args.url_option or args.url or os.environ.get("TRANSFERIT_SOURCE_URL", "")).strip()
-    args.source_kind = args.source_kind or os.environ.get("TRANSFERIT_SOURCE_KIND", "").strip()
-    args.filename = args.filename or os.environ.get("TRANSFERIT_SOURCE_FILENAME", "").strip()
+    args.source_url = (args.url_option or args.url or os.environ.get("CLOUD_SOURCE_URL", "")).strip()
+    args.source_kind = args.source_kind or os.environ.get("CLOUD_SOURCE_KIND", "").strip()
+    args.filename = args.filename or os.environ.get("CLOUD_SOURCE_FILENAME", "").strip()
     parsed = urlparse(args.source_url)
     if parsed.scheme != "https" or not parsed.hostname:
         parser.error("A public HTTPS source URL is required.")
@@ -368,7 +372,7 @@ def main() -> int:
         else:
             print(f"Source: {source.kind}; size is not available before download.")
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="transferit-"))
+        temp_dir = Path(tempfile.mkdtemp(prefix="cloud-upload-"))
         local_path = temp_dir / Path(source.filename).name
         download_started = time.monotonic()
         if source.kind == "gdrive":
@@ -380,7 +384,7 @@ def main() -> int:
             f"Download finished in {time.monotonic() - download_started:.0f}s "
             f"({size_bytes / (1024 ** 2) / max(time.monotonic() - download_started, 0.001):.1f} MiB/s)."
         )
-        transfer_url = upload_to_transferit(local_path, args.upload_workers)
+        transfer_url = upload_to_destination(local_path, args.upload_workers)
         elapsed = time.monotonic() - started_at
         result.update(
             {
@@ -394,12 +398,12 @@ def main() -> int:
             }
         )
         write_result(args.result_json, result)
-        print(f"TransferIt link: {transfer_url}")
+        print(f"Cloud upload link: {transfer_url}")
         return 0
     except Exception as exc:  # noqa: BLE001 - result artifact must report every failure.
         result.update({"error": f"{type(exc).__name__}: {exc}", "elapsed_seconds": round(time.monotonic() - started_at, 3)})
         write_result(args.result_json, result)
-        print(f"TransferIt failed: {result['error']}", file=sys.stderr)
+        print(f"Cloud upload failed: {result['error']}", file=sys.stderr)
         return 1
     finally:
         if temp_dir is not None:

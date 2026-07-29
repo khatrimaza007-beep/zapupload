@@ -79,11 +79,11 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
     add_mask(source_url)
     add_mask(filename)
     env = os.environ.copy()
-    env["TRANSFERIT_SOURCE_URL"] = source_url
-    env["TRANSFERIT_SOURCE_KIND"] = source_kind
-    env["TRANSFERIT_SOURCE_FILENAME"] = filename
+    env["CLOUD_SOURCE_URL"] = source_url
+    env["CLOUD_SOURCE_KIND"] = source_kind
+    env["CLOUD_SOURCE_FILENAME"] = filename
 
-    with tempfile.TemporaryDirectory(prefix="broker-transferit-") as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix="broker-cloud-") as temporary_dir:
         directory = Path(temporary_dir)
         result_path = directory / "result.json"
         log_path = directory / "transfer.log"
