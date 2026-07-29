@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Run one opaque broker job without exposing media details in Actions logs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--broker-url", required=True)
+    parser.add_argument("--job-id", required=True)
+    args = parser.parse_args()
+    args.broker_url = args.broker_url.rstrip("/")
+    return args
+
+
+def workflow_oidc_token(audience: str) -> str:
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+    if not request_url or not request_token:
+        raise RuntimeError("GitHub OIDC is unavailable; id-token: write is required.")
+    separator = "&" if "?" in request_url else "?"
+    response = httpx.get(
+        f"{request_url}{separator}audience={quote(audience, safe='')}",
+        headers={"Authorization": f"Bearer {request_token}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    value = response.json().get("value")
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("GitHub OIDC did not return a token.")
+    return value
+
+
+def broker_request(
+    method: str,
+    broker_url: str,
+    path: str,
+    oidc_token: str,
+    payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    response = httpx.request(
+        method,
+        f"{broker_url}{path}",
+        headers={"Authorization": f"Bearer {oidc_token}"},
+        json=payload,
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Broker returned HTTP {response.status_code}.")
+    value = response.json()
+    if not isinstance(value, dict):
+        raise RuntimeError("Broker returned an invalid response.")
+    return value
+
+
+def add_mask(value: str) -> None:
+    if value:
+        print(f"::add-mask::{value}")
+
+
+def run_transfer(job: dict[str, object]) -> dict[str, object]:
+    source_url = str(job.get("source_url") or "")
+    source_kind = str(job.get("source_kind") or "")
+    filename = str(job.get("filename") or "")
+    if not source_url or not source_kind or not filename:
+        raise RuntimeError("Broker job is incomplete.")
+
+    add_mask(source_url)
+    add_mask(filename)
+    env = os.environ.copy()
+    env["TRANSFERIT_SOURCE_URL"] = source_url
+    env["TRANSFERIT_SOURCE_KIND"] = source_kind
+    env["TRANSFERIT_SOURCE_FILENAME"] = filename
+
+    with tempfile.TemporaryDirectory(prefix="broker-transferit-") as temporary_dir:
+        directory = Path(temporary_dir)
+        result_path = directory / "result.json"
+        log_path = directory / "transfer.log"
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("cloud_to_cloud_upload.py")),
+            "--result-json",
+            str(result_path),
+            "--mode",
+            "auto",
+            "--staged-max-gib",
+            "25",
+            "--cleanup-above-gib",
+            "8",
+            "--download-workers",
+            "16",
+            "--upload-workers",
+            "8",
+        ]
+        with log_path.open("w", encoding="utf-8") as log_file:
+            completed = subprocess.run(
+                command,
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if not result_path.is_file():
+            return {"ok": False, "error": "Transfer job did not create a result."}
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"ok": False, "error": "Transfer job returned an unreadable result."}
+        if completed.returncode or result.get("ok") is not True:
+            return {"ok": False, "error": "Transfer failed in the GitHub runner."}
+
+        transfer_url = str(result.get("transfer_url") or "")
+        if not transfer_url:
+            return {"ok": False, "error": "Transfer finished without a share URL."}
+        add_mask(transfer_url)
+        return {
+            "ok": True,
+            "transfer_url": transfer_url,
+            "size_bytes": result.get("size_bytes", 0),
+            "elapsed_seconds": result.get("elapsed_seconds", 0),
+        }
+
+
+def main() -> int:
+    args = parse_args()
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    try:
+        oidc_token = workflow_oidc_token(args.broker_url)
+        job = broker_request(
+            "POST",
+            args.broker_url,
+            f"/v1/jobs/{args.job_id}/claim",
+            oidc_token,
+            {"run_id": run_id},
+        )
+        result = run_transfer(job)
+        result["run_id"] = run_id
+        broker_request(
+            "POST",
+            args.broker_url,
+            f"/v1/jobs/{args.job_id}/result",
+            oidc_token,
+            result,
+        )
+        print("Transfer job completed." if result["ok"] else "Transfer job failed.")
+        return 0 if result["ok"] else 1
+    except Exception as exc:  # noqa: BLE001 - do not print source data in Actions output.
+        print(f"Broker transfer failed: {type(exc).__name__}.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

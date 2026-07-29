@@ -323,10 +323,12 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.url and args.url_option:
         parser.error("Use either the positional URL or --url, not both.")
-    args.source_url = (args.url_option or args.url or "").strip()
+    args.source_url = (args.url_option or args.url or os.environ.get("TRANSFERIT_SOURCE_URL", "")).strip()
+    args.source_kind = args.source_kind or os.environ.get("TRANSFERIT_SOURCE_KIND", "").strip()
+    args.filename = args.filename or os.environ.get("TRANSFERIT_SOURCE_FILENAME", "").strip()
     parsed = urlparse(args.source_url)
     if parsed.scheme != "https" or not parsed.hostname:
-        parser.error("--url must be a public HTTPS URL.")
+        parser.error("A public HTTPS source URL is required.")
     if args.staged_max_gib <= 0 or args.cleanup_above_gib < 0:
         parser.error("Staging limits must be positive.")
     if args.download_workers < 1 or args.upload_workers < 1:

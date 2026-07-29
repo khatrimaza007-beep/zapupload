@@ -1,36 +1,21 @@
 name: Cloud-to-Cloud Upload
 
-run-name: TransferIt row ${{ inputs.row_number }} (${{ inputs.request_id }})
+run-name: TransferIt job ${{ inputs.job_id }}
 
 on:
   workflow_dispatch:
     inputs:
-      source_url:
-        description: Public R2, SKYDROP, Google Photos, or Google Drive URL
-        required: true
-        type: string
-      source_kind:
-        description: Source type selected by main.py
-        required: false
-        type: string
-      filename:
-        description: Original filename to preserve in TransferIt
-        required: false
-        type: string
-      row_number:
-        description: Google Sheet row number, used only for tracking
-        required: true
-        type: string
-      request_id:
-        description: Unique request ID supplied by main.py
+      job_id:
+        description: Opaque broker job identifier
         required: true
         type: string
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
-  group: transferit-${{ inputs.request_id }}
+  group: transferit-${{ inputs.job_id }}
   cancel-in-progress: false
 
 jobs:
@@ -38,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Checkout repository
+      - name: Checkout runner
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -46,46 +31,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-transferit-py-v3
-          restore-keys: ${{ runner.os }}-transferit-py-
-
       - name: Install dependencies
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-          python -m pip install transferit-py httpx beautifulsoup4 pycryptodomex websockets uvloop gdown
+          python -m pip install --disable-pip-version-check transferit-py httpx beautifulsoup4 pycryptodomex websockets uvloop gdown
 
-      - name: Transfer source to TransferIt
+      - name: Run opaque broker job
         env:
-          SOURCE_URL: ${{ inputs.source_url }}
-          SOURCE_KIND: ${{ inputs.source_kind }}
-          SOURCE_FILENAME: ${{ inputs.filename }}
-          RESULT_JSON: ${{ runner.temp }}/transferit-result.json
+          BROKER_URL: ${{ vars.TRANSFERIT_BROKER_URL }}
         run: |
-          set -o pipefail
-          SOURCE_KIND_ARG=()
-          if [ -n "$SOURCE_KIND" ]; then
-            SOURCE_KIND_ARG=(--source-kind "$SOURCE_KIND")
-          fi
-          python cloud_to_cloud_upload.py \
-            --url "$SOURCE_URL" \
-            "${SOURCE_KIND_ARG[@]}" \
-            --filename "$SOURCE_FILENAME" \
-            --result-json "$RESULT_JSON" \
-            --mode auto \
-            --staged-max-gib 25 \
-            --cleanup-above-gib 8 \
-            --download-workers 16 \
-            --upload-workers 8 | tee "$RUNNER_TEMP/transferit.log"
-
-      - name: Upload TransferIt result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: transferit-result-${{ inputs.request_id }}
-          path: ${{ runner.temp }}/transferit-result.json
-          if-no-files-found: warn
-          retention-days: 3
+          test -n "$BROKER_URL"
+          python broker_job.py \
+            --broker-url "$BROKER_URL" \
+            --job-id "${{ inputs.job_id }}"
