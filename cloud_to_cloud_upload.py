@@ -42,7 +42,11 @@ def detect_source(url: str, requested_kind: str = "") -> str:
     if requested_kind in {"r2", "skydrop", "gphotos", "gdrive", "generic"}:
         return requested_kind
     host = (urlparse(url).hostname or "").lower()
-    if host == "drive.google.com" or host.endswith(".drive.google.com"):
+    if (
+        host == "drive.google.com"
+        or host.endswith(".drive.google.com")
+        or host == "drive.usercontent.google.com"
+    ):
         return "gdrive"
     if host == "skydrop.sbs" or host.endswith(".skydrop.sbs"):
         return "skydrop"
@@ -118,6 +122,18 @@ def response_size(headers: httpx.Headers) -> int:
         return int(headers.get("Content-Length", "0"))
     except ValueError:
         return 0
+
+
+def drive_file_id_from_url(url: str) -> str:
+    """Extract a Drive file ID so gdown can handle Google's warning page."""
+    parsed = urlparse(url)
+    query_id = parse_qs(parsed.query).get("id", [""])[0].strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", query_id):
+        return query_id
+    match = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", parsed.path)
+    if match:
+        return match.group(1)
+    raise ValueError("Could not extract a Google Drive file ID from the source URL.")
 
 
 def inspect_http_source(url: str, requested_filename: str, kind: str) -> ResolvedSource:
@@ -252,8 +268,14 @@ def download_gdrive(url: str, output_path: Path) -> None:
         import gdown
     except ImportError as exc:
         raise RuntimeError("gdown is required for Google Drive sources.") from exc
-    print("Downloading Google Drive source with gdown.")
-    downloaded = gdown.download(url=url, output=str(output_path), quiet=False, fuzzy=True, resume=False)
+    file_id = drive_file_id_from_url(url)
+    print("Downloading Google Drive source with gdown (warning-page aware).")
+    downloaded = gdown.download(
+        id=file_id,
+        output=str(output_path),
+        quiet=False,
+        resume=False,
+    )
     if not downloaded:
         raise ValueError("gdown did not download a file. Check that the Google Drive link is public.")
     actual_path = Path(downloaded)
