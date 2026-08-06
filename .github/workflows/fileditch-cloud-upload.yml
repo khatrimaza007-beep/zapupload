@@ -1,0 +1,61 @@
+name: Cloud File Upload
+
+run-name: File upload job
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Public Google Drive file URL"
+        required: true
+        type: string
+      filename:
+        description: "Original filename, including extension"
+        required: true
+        type: string
+      workers:
+        description: "Parallel FileDitch chunks"
+        required: false
+        default: "6"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout uploader
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check httpx beautifulsoup4
+
+      - name: Upload through FileDitch chunks
+        env:
+          CLOUD_SOURCE_URL: ${{ inputs.url }}
+          CLOUD_SOURCE_FILENAME: ${{ inputs.filename }}
+          CLOUD_WORKERS: ${{ inputs.workers }}
+        run: |
+          echo "::add-mask::$CLOUD_SOURCE_URL"
+          python fileditch_cloud_upload.py \
+            --url "$CLOUD_SOURCE_URL" \
+            --filename "$CLOUD_SOURCE_FILENAME" \
+            --workers "$CLOUD_WORKERS" \
+            --result-json fileditch-result.json
+
+      - name: Store private result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fileditch-result-${{ github.run_id }}
+          path: fileditch-result.json
+          if-no-files-found: error
+          retention-days: 1
