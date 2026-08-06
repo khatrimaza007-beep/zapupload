@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Run one opaque broker job without exposing media details in Actions logs."""
 
 from __future__ import annotations
@@ -73,6 +73,8 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
     source_url = str(job.get("source_url") or "")
     source_kind = str(job.get("source_kind") or "")
     filename = str(job.get("filename") or "")
+    pixel_keys = [str(value).strip() for value in job.get("pixeldrain_api_keys", []) if str(value).strip()]
+    viking_hash = str(job.get("vikingfile_user_hash") or "").strip()
     if not source_url or not source_kind or not filename:
         raise RuntimeError("Broker job is incomplete.")
 
@@ -82,6 +84,11 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
     env["CLOUD_SOURCE_URL"] = source_url
     env["CLOUD_SOURCE_KIND"] = source_kind
     env["CLOUD_SOURCE_FILENAME"] = filename
+    env["CLOUD_PIXELDRAIN_KEYS_JSON"] = json.dumps(pixel_keys)
+    env["CLOUD_VIKINGFILE_USER_HASH"] = viking_hash
+    for value in pixel_keys:
+        add_mask(value)
+    add_mask(viking_hash)
 
     with tempfile.TemporaryDirectory(prefix="broker-cloud-") as temporary_dir:
         directory = Path(temporary_dir)
@@ -121,16 +128,23 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
             error = str(result.get("error") or "Transfer failed in the GitHub runner.")
             return {"ok": False, "error": error[:500]}
 
-        transfer_url = str(result.get("transfer_url") or "")
-        if not transfer_url:
-            return {"ok": False, "error": "Transfer finished without a share URL."}
-        add_mask(transfer_url)
-        return {
+        provider_urls = {
+            "transfer_url": str(result.get("transfer_url") or ""),
+            "pixeldrain_url": str(result.get("pixeldrain_url") or ""),
+            "vikingfile_url": str(result.get("vikingfile_url") or ""),
+        }
+        if not any(provider_urls.values()):
+            return {"ok": False, "error": "Cloud job finished without a provider URL."}
+        for value in provider_urls.values():
+            add_mask(value)
+        response = {
             "ok": True,
-            "transfer_url": transfer_url,
             "size_bytes": result.get("size_bytes", 0),
             "elapsed_seconds": result.get("elapsed_seconds", 0),
+            "provider_errors": result.get("provider_errors", {}),
         }
+        response.update({key: value for key, value in provider_urls.items() if value})
+        return response
 
 
 def main() -> int:
