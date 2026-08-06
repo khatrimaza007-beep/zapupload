@@ -87,7 +87,7 @@ def iter_drive_range(
 ):
     """Yield one verified Drive range, refreshing the URL only in the caller."""
     expected = end - start + 1
-    response = client.build_request(
+    with client.stream(
         "GET",
         candidate_url,
         headers={
@@ -95,8 +95,7 @@ def iter_drive_range(
             "Accept-Encoding": "identity",
             "User-Agent": USER_AGENT,
         },
-    )
-    with client.send(response, stream=True) as source:
+    ) as source:
         content_range = source.headers.get("Content-Range", "")
         expected_range = f"bytes {start}-{end}/{total}"
         if source.status_code != 206 or content_range.lower() != expected_range.lower():
