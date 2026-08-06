@@ -177,7 +177,7 @@ def drive_range_total(url: str) -> int:
     return int(match.group(1))
 
 
-def download_drive_ranges(url: str, output_path: Path, workers: int) -> None:
+def download_drive_ranges(url: str, output_path: Path, workers: int, file_id: str) -> None:
     """Download a large Drive file using verified small ranges."""
     total = drive_range_total(url)
     chunk_size = 4 * 1024 * 1024
@@ -193,10 +193,11 @@ def download_drive_ranges(url: str, output_path: Path, workers: int) -> None:
         start, end = item
         expected = end - start + 1
         last_error = "Google Drive range failed."
+        candidate_url = url
         for attempt in range(1, 6):
             try:
                 response = httpx.get(
-                    url,
+                    candidate_url,
                     headers={
                         "Range": f"bytes={start}-{end}",
                         "Accept-Encoding": "identity",
@@ -223,6 +224,12 @@ def download_drive_ranges(url: str, output_path: Path, workers: int) -> None:
             except Exception as exc:  # noqa: BLE001 - retry transient Drive responses.
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < 5:
+                    try:
+                        # Drive's large-file confirmation UUID can occasionally
+                        # reject a range or return HTTP 500 under concurrency.
+                        candidate_url = resolve_drive_confirmation_url(file_id)
+                    except Exception:
+                        pass
                     time.sleep(min(2 * attempt, 10))
         raise RuntimeError(f"Drive range {start}-{end} failed: {last_error}")
 
@@ -376,7 +383,7 @@ def download_gdrive(url: str, output_path: Path, workers: int) -> None:
     file_id = drive_file_id_from_url(url)
     print("Downloading Google Drive source with verified parallel ranges.")
     direct_url = resolve_drive_confirmation_url(file_id)
-    download_drive_ranges(direct_url, output_path, workers)
+    download_drive_ranges(direct_url, output_path, workers, file_id)
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise ValueError("Ranged Google Drive download completed without a usable local file.")
     if output_path.stat().st_size < 100_000:
