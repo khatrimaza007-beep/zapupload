@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,114 @@ def drive_file_id_from_url(url: str) -> str:
     if match:
         return match.group(1)
     raise ValueError("Could not extract a Google Drive file ID from the source URL.")
+
+
+def resolve_drive_confirmation_url(file_id: str) -> str:
+    """Resolve Drive's virus-scan form without following it with a normal GET."""
+    response = httpx.get(
+        f"https://drive.google.com/uc?id={file_id}",
+        follow_redirects=True,
+        timeout=httpx.Timeout(60.0),
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    form = soup.select_one("form#download-form") or soup.select_one("form")
+    if form is None:
+        raise ValueError("Google Drive did not provide a confirmation form for the file.")
+    action = urljoin(str(response.url), str(form.get("action") or ""))
+    if not action.startswith("https://"):
+        raise ValueError("Google Drive returned an invalid confirmation URL.")
+    pairs: list[tuple[str, str]] = []
+    for field in form.select("input[name]"):
+        pairs.append((str(field.get("name")), str(field.get("value") or "")))
+    return f"{action}?{urlencode(pairs)}"
+
+
+def drive_range_total(url: str) -> int:
+    response = httpx.get(
+        url,
+        headers={"Range": "bytes=0-0", "Accept-Encoding": "identity", "User-Agent": USER_AGENT},
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0),
+    )
+    response.raise_for_status()
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes\s+0-0/(\d+)", content_range, re.IGNORECASE)
+    if response.status_code != 206 or match is None:
+        raise ValueError(
+            "Google Drive did not return a verified ranged file response "
+            f"(HTTP {response.status_code}, Content-Type={response.headers.get('Content-Type', '')})."
+        )
+    return int(match.group(1))
+
+
+def download_drive_ranges(url: str, output_path: Path, workers: int) -> None:
+    """Download a large Drive file using verified small ranges."""
+    total = drive_range_total(url)
+    chunk_size = 4 * 1024 * 1024
+    ranges = [
+        (start, min(total - 1, start + chunk_size - 1))
+        for start in range(0, total, chunk_size)
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as output:
+        output.truncate(total)
+
+    def download_range(item: tuple[int, int]) -> tuple[int, int]:
+        start, end = item
+        expected = end - start + 1
+        last_error = "Google Drive range failed."
+        for attempt in range(1, 6):
+            try:
+                response = httpx.get(
+                    url,
+                    headers={
+                        "Range": f"bytes={start}-{end}",
+                        "Accept-Encoding": "identity",
+                        "User-Agent": USER_AGENT,
+                    },
+                    follow_redirects=True,
+                    timeout=httpx.Timeout(connect=60.0, read=300.0, write=60.0, pool=60.0),
+                )
+                response.raise_for_status()
+                content_range = response.headers.get("Content-Range", "")
+                match = re.fullmatch(
+                    rf"bytes\s+{start}-{end}/(\d+)", content_range, re.IGNORECASE
+                )
+                data = response.content
+                if response.status_code != 206 or match is None or len(data) != expected:
+                    raise ValueError(
+                        f"invalid response for bytes {start}-{end}: HTTP {response.status_code}, "
+                        f"Content-Range={content_range or '<missing>'}, bytes={len(data)}"
+                    )
+                with output_path.open("r+b") as output:
+                    output.seek(start)
+                    output.write(data)
+                return start, len(data)
+            except Exception as exc:  # noqa: BLE001 - retry transient Drive responses.
+                last_error = f"{type(exc).__name__}: {exc}"
+                if attempt < 5:
+                    time.sleep(min(2 * attempt, 10))
+        raise RuntimeError(f"Drive range {start}-{end} failed: {last_error}")
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(32, workers))) as executor:
+        futures = {executor.submit(download_range, item): item for item in ranges}
+        for future in as_completed(futures):
+            _, count = future.result()
+            completed += count
+            print(
+                f"\rDownloading Google Drive ranges: {completed / (1024 ** 3):.2f} / "
+                f"{total / (1024 ** 3):.2f} GiB ({completed * 100 / total:.1f}%)",
+                end="",
+                flush=True,
+            )
+    print("")
+    if output_path.stat().st_size != total:
+        raise ValueError(
+            f"Ranged Google Drive download stored {output_path.stat().st_size} bytes; expected {total}."
+        )
 
 
 def inspect_http_source(url: str, requested_filename: str, kind: str) -> ResolvedSource:
@@ -263,26 +372,13 @@ def download_http_source(source: ResolvedSource, output_path: Path, download_wor
     download_single_stream(source.direct_url, output_path)
 
 
-def download_gdrive(url: str, output_path: Path) -> None:
-    try:
-        import gdown
-    except ImportError as exc:
-        raise RuntimeError("gdown is required for Google Drive sources.") from exc
+def download_gdrive(url: str, output_path: Path, workers: int) -> None:
     file_id = drive_file_id_from_url(url)
-    print("Downloading Google Drive source with gdown (warning-page aware).")
-    downloaded = gdown.download(
-        id=file_id,
-        output=str(output_path),
-        quiet=False,
-        resume=False,
-    )
-    if not downloaded:
-        raise ValueError("gdown did not download a file. Check that the Google Drive link is public.")
-    actual_path = Path(downloaded)
-    if actual_path != output_path:
-        actual_path.replace(output_path)
+    print("Downloading Google Drive source with verified parallel ranges.")
+    direct_url = resolve_drive_confirmation_url(file_id)
+    download_drive_ranges(direct_url, output_path, workers)
     if not output_path.is_file() or output_path.stat().st_size == 0:
-        raise ValueError("gdown completed without a usable local file.")
+        raise ValueError("Ranged Google Drive download completed without a usable local file.")
     if output_path.stat().st_size < 100_000:
         sample = output_path.read_bytes()[:4096].lower()
         if b"<html" in sample or b"<!doctype" in sample:
@@ -398,7 +494,7 @@ def main() -> int:
         local_path = temp_dir / Path(source.filename).name
         download_started = time.monotonic()
         if source.kind == "gdrive":
-            download_gdrive(source_url, local_path)
+            download_gdrive(source_url, local_path, args.download_workers)
         else:
             download_http_source(source, local_path, args.download_workers)
         size_bytes = local_path.stat().st_size

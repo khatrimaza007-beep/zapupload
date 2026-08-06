@@ -118,7 +118,8 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
         except (OSError, json.JSONDecodeError):
             return {"ok": False, "error": "Transfer job returned an unreadable result."}
         if completed.returncode or result.get("ok") is not True:
-            return {"ok": False, "error": "Transfer failed in the GitHub runner."}
+            error = str(result.get("error") or "Transfer failed in the GitHub runner.")
+            return {"ok": False, "error": error[:500]}
 
         transfer_url = str(result.get("transfer_url") or "")
         if not transfer_url:
