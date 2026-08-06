@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Download a public cloud source to a GitHub runner and upload it."""
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ DEFAULT_STAGED_MAX_GIB = 20.0
 DEFAULT_CLEANUP_ABOVE_GIB = 8.0
 DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 MEDIA_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".zip", ".rar", ".7z")
+PIXELDRAIN_LIMIT_BYTES = 10_000_000_000
+VIKINGFILE_API_ORIGIN = "https://vikingfile.com"
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,8 @@ class ResolvedSource:
 
 
 def detect_source(url: str, requested_kind: str = "") -> str:
+    if requested_kind in {"zip", "zip-large"}:
+        return "generic"
     if requested_kind in {"r2", "skydrop", "gphotos", "gdrive", "generic"}:
         return requested_kind
     host = (urlparse(url).hostname or "").lower()
@@ -441,6 +445,114 @@ def upload_to_destination(local_path: Path, upload_workers: int) -> str:
     return link
 
 
+def upload_to_pixeldrain(local_path: Path, api_keys: list[str]) -> str:
+    """Upload one staged file, rotating only when an account key is rejected."""
+    last_error = "PixelDrain upload failed."
+    size = local_path.stat().st_size
+    for api_key in api_keys:
+        try:
+            with local_path.open("rb") as source, httpx.Client(
+                timeout=httpx.Timeout(connect=60.0, read=1800.0, write=1800.0, pool=60.0)
+            ) as client:
+                response = client.put(
+                    f"https://pixeldrain.com/api/file/{quote(local_path.name, safe='')}",
+                    auth=("", api_key),
+                    content=source,
+                    headers={
+                        "Content-Length": str(size),
+                        "Content-Type": "application/octet-stream",
+                        "Accept": "application/json",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+            payload = response.json()
+            if response.is_success and isinstance(payload, dict) and payload.get("id"):
+                return f"https://pixeldrain.com/u/{payload['id']}"
+            last_error = str(payload.get("message") or payload.get("value") or f"HTTP {response.status_code}")
+        except Exception as exc:  # noqa: BLE001 - try the next private account.
+            last_error = f"{type(exc).__name__}: {exc}"
+    raise RuntimeError(last_error[:300])
+
+
+def upload_to_vikingfile(local_path: Path, user_hash: str, upload_workers: int) -> str:
+    """Upload a staged file with VikingFile's multipart API."""
+    size = local_path.stat().st_size
+    with httpx.Client(timeout=httpx.Timeout(120.0)) as client:
+        init = client.post(f"{VIKINGFILE_API_ORIGIN}/api/get-upload-url", data={"size": str(size)})
+        init.raise_for_status()
+        payload = init.json()
+
+    upload_id = str(payload.get("uploadId") or "")
+    key = str(payload.get("key") or "")
+    part_size = int(payload.get("partSize") or 0)
+    number_parts = int(payload.get("numberParts") or 0)
+    upload_urls = payload.get("urls")
+    if not upload_id or not key or part_size <= 0 or number_parts <= 0 or not isinstance(upload_urls, list):
+        raise RuntimeError("VikingFile returned invalid multipart initialization data.")
+    if len(upload_urls) != number_parts:
+        raise RuntimeError("VikingFile returned an incomplete multipart URL list.")
+
+    def upload_part(part_number: int) -> tuple[int, str]:
+        offset = (part_number - 1) * part_size
+        length = min(part_size, size - offset)
+        last_error = "VikingFile part upload failed."
+        for attempt in range(1, 4):
+            try:
+                with local_path.open("rb") as source:
+                    source.seek(offset)
+                    data = source.read(length)
+                if len(data) != length:
+                    raise RuntimeError(f"Read {len(data)} bytes; expected {length}.")
+                response = httpx.put(
+                    str(upload_urls[part_number - 1]),
+                    content=data,
+                    headers={"Content-Type": "application/octet-stream", "Content-Length": str(length)},
+                    timeout=httpx.Timeout(connect=60.0, read=900.0, write=900.0, pool=60.0),
+                )
+                response.raise_for_status()
+                etag = str(response.headers.get("etag") or "").strip()
+                if not etag:
+                    raise RuntimeError("VikingFile part returned no ETag.")
+                return part_number, etag
+            except Exception as exc:  # noqa: BLE001 - retry the exact part.
+                last_error = f"{type(exc).__name__}: {exc}"
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+        raise RuntimeError(last_error)
+
+    completed_parts: list[tuple[int, str]] = []
+    with ThreadPoolExecutor(max_workers=max(1, min(5, upload_workers, number_parts))) as executor:
+        futures = [executor.submit(upload_part, part_number) for part_number in range(1, number_parts + 1)]
+        for future in as_completed(futures):
+            completed_parts.append(future.result())
+    completed_parts.sort()
+
+    complete_data: list[tuple[str, str]] = [
+        ("key", key),
+        ("uploadId", upload_id),
+        ("name", local_path.name),
+        ("user", user_hash),
+    ]
+    for index, (part_number, etag) in enumerate(completed_parts):
+        complete_data.append((f"parts[{index}][PartNumber]", str(part_number)))
+        complete_data.append((f"parts[{index}][ETag]", etag))
+    response = httpx.post(
+        f"{VIKINGFILE_API_ORIGIN}/api/complete-upload",
+        content=urlencode(complete_data),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=180.0,
+    )
+    response.raise_for_status()
+    complete_payload = response.json()
+    link = str(complete_payload.get("url") or complete_payload.get("downloadUrl") or "").strip()
+    if not link.startswith("https://vikingfile.com/f/"):
+        raise RuntimeError("VikingFile completion returned no valid URL.")
+    stored_size = int(complete_payload.get("size") or size)
+    if stored_size != size:
+        raise RuntimeError(f"VikingFile stored {stored_size} bytes; expected {size}.")
+    return link
+
+
 def write_result(path: str | None, result: dict[str, Any]) -> None:
     if not path:
         return
@@ -482,7 +594,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     source_url = args.source_url
-    kind = detect_source(source_url, args.source_kind or "")
+    requested_kind = args.source_kind or ""
+    kind = detect_source(source_url, requested_kind)
     if kind == "skydrop":
         source_url = add_skydrop_direct_flag(source_url)
     started_at = time.monotonic()
@@ -523,22 +636,48 @@ def main() -> int:
             f"Download finished in {time.monotonic() - download_started:.0f}s "
             f"({size_bytes / (1024 ** 2) / max(time.monotonic() - download_started, 0.001):.1f} MiB/s)."
         )
-        transfer_url = upload_to_destination(local_path, args.upload_workers)
+        provider_tasks: dict[str, Any] = {
+            "transfer_url": lambda: upload_to_destination(local_path, args.upload_workers),
+        }
+        try:
+            pixel_keys = json.loads(os.environ.get("CLOUD_PIXELDRAIN_KEYS_JSON", "[]"))
+        except json.JSONDecodeError:
+            pixel_keys = []
+        pixel_keys = [str(value).strip() for value in pixel_keys if str(value).strip()]
+        viking_hash = os.environ.get("CLOUD_VIKINGFILE_USER_HASH", "").strip()
+        if requested_kind == "zip" and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
+            provider_tasks["pixeldrain_url"] = lambda: upload_to_pixeldrain(local_path, pixel_keys)
+        if requested_kind in {"zip", "zip-large"} and viking_hash:
+            provider_tasks["vikingfile_url"] = lambda: upload_to_vikingfile(
+                local_path, viking_hash, args.upload_workers
+            )
+
+        provider_urls: dict[str, str] = {}
+        provider_errors: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(provider_tasks)) as executor:
+            futures = {executor.submit(task): name for name, task in provider_tasks.items()}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    provider_urls[name] = future.result()
+                except Exception as exc:  # noqa: BLE001 - preserve successful mirrors.
+                    provider_errors[name.removesuffix("_url")] = f"{type(exc).__name__}: {exc}"[:300]
         elapsed = time.monotonic() - started_at
         result.update(
             {
-                "ok": True,
-                "transfer_url": transfer_url,
+                "ok": bool(provider_urls),
                 "filename": local_path.name,
                 "size_bytes": size_bytes,
                 "elapsed_seconds": round(elapsed, 3),
                 "average_mib_per_second": round(size_bytes / (1024 ** 2) / max(elapsed, 0.001), 3),
                 "mode": "staged",
+                "provider_errors": provider_errors,
+                **provider_urls,
             }
         )
         write_result(args.result_json, result)
-        print(f"Cloud upload link: {transfer_url}")
-        return 0
+        print(f"Cloud upload completed with {len(provider_urls)}/{len(provider_tasks)} provider links.")
+        return 0 if provider_urls else 1
     except Exception as exc:  # noqa: BLE001 - result artifact must report every failure.
         result.update({"error": f"{type(exc).__name__}: {exc}", "elapsed_seconds": round(time.monotonic() - started_at, 3)})
         write_result(args.result_json, result)
