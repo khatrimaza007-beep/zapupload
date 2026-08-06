@@ -645,7 +645,7 @@ def main() -> int:
             pixel_keys = []
         pixel_keys = [str(value).strip() for value in pixel_keys if str(value).strip()]
         viking_hash = os.environ.get("CLOUD_VIKINGFILE_USER_HASH", "").strip()
-        if requested_kind == "zip" and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
+        if requested_kind in {"zip", "skydrop"} and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
             provider_tasks["pixeldrain_url"] = lambda: upload_to_pixeldrain(local_path, pixel_keys)
         if requested_kind in {"zip", "zip-large"} and viking_hash:
             provider_tasks["vikingfile_url"] = lambda: upload_to_vikingfile(
