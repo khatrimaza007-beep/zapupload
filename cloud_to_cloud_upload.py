@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
-DEFAULT_STAGED_MAX_GIB = 25.0
+DEFAULT_STAGED_MAX_GIB = 20.0
 DEFAULT_CLEANUP_ABOVE_GIB = 8.0
 DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 MEDIA_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".zip", ".rar", ".7z")
@@ -551,3 +551,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
