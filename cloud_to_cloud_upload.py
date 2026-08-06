@@ -159,27 +159,41 @@ def resolve_drive_confirmation_url(file_id: str) -> str:
     return f"{action}?{urlencode(pairs)}"
 
 
-def drive_range_total(url: str) -> int:
-    response = httpx.get(
-        url,
-        headers={"Range": "bytes=0-0", "Accept-Encoding": "identity", "User-Agent": USER_AGENT},
-        follow_redirects=True,
-        timeout=httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0),
-    )
-    response.raise_for_status()
-    content_range = response.headers.get("Content-Range", "")
-    match = re.fullmatch(r"bytes\s+0-0/(\d+)", content_range, re.IGNORECASE)
-    if response.status_code != 206 or match is None:
-        raise ValueError(
-            "Google Drive did not return a verified ranged file response "
-            f"(HTTP {response.status_code}, Content-Type={response.headers.get('Content-Type', '')})."
-        )
-    return int(match.group(1))
+def drive_range_total(url: str, file_id: str) -> int:
+    candidate_url = url
+    last_error = "Google Drive did not return a verified ranged file response."
+    for attempt in range(1, 7):
+        try:
+            response = httpx.get(
+                candidate_url,
+                headers={
+                    "Range": "bytes=0-0",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": USER_AGENT,
+                },
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0),
+            )
+            content_range = response.headers.get("Content-Range", "")
+            match = re.fullmatch(r"bytes\s+0-0/(\d+)", content_range, re.IGNORECASE)
+            if response.status_code == 206 and match is not None:
+                return int(match.group(1))
+            response.raise_for_status()
+            last_error = (
+                "Google Drive did not return a verified ranged file response "
+                f"(HTTP {response.status_code}, Content-Type={response.headers.get('Content-Type', '')})."
+            )
+        except Exception as exc:  # noqa: BLE001 - refresh intermittent Drive sessions.
+            last_error = f"{type(exc).__name__}: {exc}"
+        if attempt < 6:
+            candidate_url = resolve_drive_confirmation_url(file_id)
+            time.sleep(min(attempt, 5))
+    raise ValueError(last_error)
 
 
 def download_drive_ranges(url: str, output_path: Path, workers: int, file_id: str) -> None:
     """Download a large Drive file using verified small ranges."""
-    total = drive_range_total(url)
+    total = drive_range_total(url, file_id)
     chunk_size = 4 * 1024 * 1024
     ranges = [
         (start, min(total - 1, start + chunk_size - 1))
