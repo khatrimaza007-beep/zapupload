@@ -95,7 +95,7 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
             "--mode",
             "auto",
             "--staged-max-gib",
-            "25",
+            "20",
             "--cleanup-above-gib",
             "8",
             "--download-workers",
@@ -163,3 +163,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
